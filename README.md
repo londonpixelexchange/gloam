@@ -16,8 +16,7 @@ gloam https://ice1.somafm.com/groovesalad-128-mp3
 ```
 
 Homebrew handles ffmpeg, NumPy and the audio dependencies; no setup or environment
-activation is needed. See [Homebrew release notes](packaging/homebrew/README.md)
-for publishing steps.
+activation is needed.
 
 ### From source
 
