@@ -117,7 +117,7 @@ REACT_LEVELS = ((0.0, "off"), (0.5, "subtle"), (1.0, "gentle"), (1.6, "normal"),
 REACT_DEFAULT = 1.6
 PIPE_LEAD = 0.3
 AHEAD = 0.13
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 UA = f"gloam/{__version__}"
 try:
     import certifi
@@ -846,13 +846,21 @@ class Player:
 
     def _pump(self, gen, resp, stdin):
         metaint = int(resp.headers.get("icy-metaint") or 0)
+        remaining = metaint
+        # HTTPResponse.read(n) waits for all n bytes. A metadata interval (or
+        # 16 KiB on streams without metadata) can exceed the playback buffer.
+        # Forward available bytes promptly, without crossing metadata boundaries.
+        read_audio = getattr(resp, "read1", resp.read)
         try:
             while gen == self.gen:
-                data = resp.read(metaint or 16384)
+                data = read_audio(min(4096, remaining) if metaint else 4096)
                 if not data:
                     break
                 stdin.write(data)
+                stdin.flush()
                 if metaint:
+                    remaining -= len(data)
+                if metaint and remaining == 0:
                     n = resp.read(1)
                     if not n:
                         break
@@ -860,6 +868,7 @@ class Player:
                         m = re.search(rb"StreamTitle='(.*?)';", resp.read(n[0] * 16), re.S)
                         if m and gen == self.gen:
                             self.title = decode(m.group(1)).strip()
+                    remaining = metaint
         except (OSError, ValueError, http.client.HTTPException):
             pass
         finally:
