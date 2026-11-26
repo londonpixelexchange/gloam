@@ -94,7 +94,7 @@ REACT_LEVELS = ((0.0, "off"), (0.5, "subtle"), (1.0, "gentle"), (1.6, "normal"),
 REACT_DEFAULT = 1.6
 PIPE_LEAD = 0.3
 AHEAD = 0.13
-__version__ = "1.0"
+__version__ = "1.0.1"
 UA = f"gloam/{__version__}"
 try:
     import certifi
