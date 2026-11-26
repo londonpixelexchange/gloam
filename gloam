@@ -170,7 +170,7 @@ class Field:
         r = self.r / (size * np.exp(squash * self.squash))
         return np.stack([self.darkening(r / k) for k in channels], -1)
 
-    def colours(self, t, pal, new, sweep, hue, bright, shape=None):
+    def colours(self, t, pal, new, sweep, hue, bright, shape=None, numeric=False):
         ph = self.phase + t
         dark = self.dark if shape is None else self.bent(shape)
         c = self._shade(PALETTES[pal], ph, dark)
@@ -180,7 +180,8 @@ class Field:
         if hue % 360:
             c = c @ np.array(hue_matrix(hue)).T
         c = np.clip(c * (255 * bright / 100) + 0.5, 0, 255).astype(np.uint8)
-        return [list(map(tuple, row)) for row in c.tolist()], ((ph % CYCLE) * 100 / CYCLE).astype(int).tolist()
+        nums = ((ph % CYCLE) * 100 / CYCLE).astype(int) if numeric else None
+        return c, nums
 
     def _shade(self, par, ph, dark):
         s32, s25 = np.sin(3.2 + ph), np.sin(2.5 + ph)
@@ -196,62 +197,103 @@ class Field:
         return 0.9 * c + 0.0102
 
 
-def cube(c):
-    r, g, b = (int(x * 5 / 255 + 0.5) for x in c)
-    return 16 + 36 * r + 6 * g + b
+class Renderer:
+    """Cache visible cells and write changed runs, or full frames for dense changes."""
 
+    def __init__(self, mode, layout, mini_char):
+        self.mode, self.layout, self.mini_char = mode, layout, mini_char
+        self.previous = self.previous_status = None
+        self.cw, self.ch = LAYOUTS[layout]
 
-def code(c, mode, ground):
-    if mode == "24bit":
-        return f"{ESC}[{ground};2;{c[0]};{c[1]};{c[2]}m"
-    return f"{ESC}[{ground};5;{cube(c)}m"
-
-
-def render(rows, nums, mode, layout, mini_char, status, cols):
-    out = [ESC + "[H"]
-    cw, ch = LAYOUTS[layout]
-    reps = ch // 2 if layout != "half" else 1
-    if mode == "ascii":
-        for row, nrow in zip(rows, nums):
-            if layout == "num":
-                line = "".join(f"{n:>{cw}}" for n in nrow)
+    def cells(self, rows, nums):
+        # Compare what the terminal displays, including quantized colours and glyphs.
+        if self.mode == "ascii":
+            glyphs = nums if self.layout == "num" else np.minimum(9, rows.sum(-1, dtype=np.int32) // 77)
+            colours = np.full(glyphs.shape, -1, dtype=np.int32)
+        else:
+            rgb = rows.astype(np.int32)
+            if self.mode == "256":
+                rgb = (rgb * 10 + 255) // 510
+                colours = 16 + rgb[..., 0] * 36 + rgb[..., 1] * 6 + rgb[..., 2]
             else:
-                line = "".join(RAMP[min(9, sum(c) // 77)] * cw for c in row)
-            for _ in range(reps):
-                out.append(line + "\r\n")
-    elif layout == "half":
-        if len(rows) % 2:
-            rows.append(rows[-1])
-        for y in range(0, len(rows), 2):
-            fg = bg = None
-            parts = []
-            for t, b in zip(rows[y], rows[y + 1]):
-                if b != bg:
-                    parts.append(code(b, mode, 48))
-                    bg = b
-                if t == b:
-                    parts.append(" ")
-                else:
-                    if t != fg:
-                        parts.append(code(t, mode, 38))
-                        fg = t
-                    parts.append(HALF)
-            out.append("".join(parts) + ESC + "[0m\r\n")
-    else:
-        ground = 38 if layout == "num" or mini_char != " " else 48
-        for row, nrow in zip(rows, nums):
-            last = None
-            parts = []
-            for c, n in zip(row, nrow):
-                if c != last:
-                    parts.append(code(c, mode, ground))
-                    last = c
-                parts.append(f"{n:>{cw}}" if layout == "num" else mini_char * cw)
-            line = "".join(parts) + ESC + "[0m\r\n"
-            for _ in range(reps):
-                out.append(line)
-    out.append(ESC + "[0m" + ESC + "[2m" + status[:cols] + ESC + "[0m" + ESC + "[K")
-    return "".join(out)
+                colours = (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]
+            glyphs = nums if self.layout == "num" else np.zeros(colours.shape, dtype=np.int32)
+        if self.layout == "half" and self.mode != "ascii":
+            if len(colours) % 2:
+                colours = np.concatenate((colours, colours[-1:]))
+            top, bottom = colours[::2], colours[1::2]
+            # A space only displays its background; ignore its foreground.
+            cells = np.stack((np.where(top == bottom, -1, top), bottom,
+                              (top != bottom).astype(np.int32)), -1)
+        else:
+            default = np.full(colours.shape, -1, dtype=np.int32)
+            foreground = self.layout == "num" or self.mini_char != " "
+            fg, bg = (colours, default) if foreground else (default, colours)
+            cells = np.stack((fg, bg, glyphs), -1)
+            cells = np.repeat(cells, max(1, self.ch // 2), axis=0)
+        return cells
+
+    def colour_params(self, colour, ground):
+        if self.mode == "256":
+            return f"{ground};5;{colour}"
+        return f"{ground};2;{colour >> 16};{(colour >> 8) & 255};{colour & 255}"
+
+    def render(self, rows, nums, status, cols):
+        cells = self.cells(rows, nums)
+        full = self.previous is None or self.previous.shape != cells.shape
+        changed = None if full else np.any(cells != self.previous, axis=-1)
+        # Avoid cursor movements and run bookkeeping when most cells change.
+        if not full:
+            full = np.count_nonzero(changed) > changed.size * 0.6
+        out = []
+        fg = bg = -1
+        for y in range(len(cells)):
+            if full:
+                runs = [(0, cells.shape[1])]
+            else:
+                xs = np.flatnonzero(changed[y])
+                if not len(xs):
+                    continue
+                cuts = np.flatnonzero(np.diff(xs) > 1)
+                starts = np.concatenate((xs[:1], xs[cuts + 1]))
+                ends = np.concatenate((xs[cuts] + 1, xs[-1:] + 1))
+                runs = zip(starts, ends)
+            for start, end in runs:
+                if not out:
+                    out.append(ESC + "[0m")
+                out.append(f"{ESC}[{y + 1};{start * self.cw + 1}H")
+                # Convert only cells that will actually be sent to the terminal.
+                for top, bottom, glyph in cells[y, start:end].tolist():
+                    if top != -1 and top != fg and bottom != -1 and bottom != bg:
+                        # The common truecolour half-cell path: format one SGR directly.
+                        if self.mode == "24bit":
+                            out.append(f"{ESC}[38;2;{top >> 16};{(top >> 8) & 255};{top & 255};"
+                                       f"48;2;{bottom >> 16};{(bottom >> 8) & 255};{bottom & 255}m")
+                        else:
+                            out.append(f"{ESC}[38;5;{top};48;5;{bottom}m")
+                        fg, bg = top, bottom
+                    else:
+                        if top != -1 and top != fg:
+                            out.append(ESC + "[" + self.colour_params(top, 38) + "m")
+                            fg = top
+                        if bottom != -1 and bottom != bg:
+                            out.append(ESC + "[" + self.colour_params(bottom, 48) + "m")
+                            bg = bottom
+                    if self.layout == "num":
+                        out.append(f"{glyph:>{self.cw}}")
+                    elif self.mode == "ascii":
+                        out.append(RAMP[glyph] * self.cw)
+                    elif self.layout == "half":
+                        out.append(HALF if glyph else " ")
+                    else:
+                        out.append(self.mini_char * self.cw)
+        status = status[:cols]
+        if full or status != self.previous_status:
+            out.append(f"{ESC}[{len(cells) + 1};1H{ESC}[0;2m" + status + ESC + "[0m" + ESC + "[K")
+        elif out:
+            out.append(ESC + "[0m")
+        self.previous, self.previous_status = cells, status
+        return "".join(out)
 
 
 class Analyser:
@@ -852,6 +894,7 @@ def main():
                 size = (cols, rows)
                 cw, ch = LAYOUTS[layout]
                 field = Field(max(1, cols // cw), max(1, (rows - 1) * 2 // ch), cw, ch, sat, keep_hue)
+                renderer = Renderer(mode, layout, mini_char)
                 out.write(ESC + "[2J")
             while True:
                 left = nxt - time.monotonic()
@@ -935,7 +978,8 @@ def main():
                     change_at = now + CHANGE_EVERY
             elif not hold and now >= change_at:
                 new, sweep = NAMES[(NAMES.index(pal) + 1) % len(NAMES)], 0.0
-            colours, nums = field.colours(t, pal, new, sweep, hue, bright, shape)
+            colours, nums = field.colours(t, pal, new, sweep, hue, bright, shape,
+                                          numeric=layout == "num")
 
             if now < note_until:
                 status = note
@@ -951,7 +995,7 @@ def main():
                     status = f" {label}{short_name(src)}  {player.state}"
                     if retry_at is not None:
                         status += f"  (trying again in {int(retry_at - now) + 1}s)"
-            out.write(render(colours, nums, mode, layout, mini_char, status, cols))
+            out.write(renderer.render(colours, nums, status, cols))
             out.flush()
     except KeyboardInterrupt:
         pass
