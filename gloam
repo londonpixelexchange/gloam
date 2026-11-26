@@ -6,7 +6,9 @@ Plays internet radio (Icecast, SHOUTcast and HLS streams, .pls and .m3u
 links) and any local audio file ffmpeg can read, and draws the background's
 shader in the terminal.
 
-Requirements: Python 3.8+, numpy and ffmpeg, on macOS or Linux. For sound,
+Requirements: Python 3.8+, numpy and ffmpeg, on macOS or Linux. Run ./setup
+once to install Python dependencies; ./gloam then uses them without activation.
+For sound,
 install sounddevice (pip install sounddevice), which also keeps the picture
 in step with the sound most closely. Without it, gloam falls back to
 ffmpeg's macOS audio output, ffplay, paplay, pw-cat, aplay or SoX's play.
@@ -28,7 +30,8 @@ builds that lack system certificates.
 Display options: --full, --mini [C], --num, --chunky (cell layouts),
 --256, --nocolour, --fps, --speed, --size WxH, --hue, --brightness,
 --colour (richness, default 0.5) and --white (0 lets over-bright cells go
-white, 1 keeps their colour). See --help.
+white, 1 keeps their colour). --vignette [WIDTH] fades the edges into the
+terminal background; --background '#RRGGBB' overrides that colour. See --help.
 
 Keys while it runs:
     n / b        next / previous source
@@ -36,12 +39,17 @@ Keys while it runs:
     m            mute
     r / R        react more / less
     { / }        picture earlier / later against the sound, 10 ms a press
-    p            next palette now
+    p / P        next / previous palette now
     h            hold the palette / let it change
+    v            toggle the vignette
+    ( / )        narrower / wider vignette, 0.05 a press
     + / -        turn the colours round the colour wheel
     [ / ]        darker / brighter
     < / >        colours move slower / faster (also , / .)
     i            show where the sound is going
+    ?            toggle keyboard help (Space for next page)
+    s            toggle current settings (Space for next page)
+    t            show / hide now playing
     q            quit (Ctrl-C works too)
 """
 import argparse
@@ -58,16 +66,31 @@ import subprocess
 import sys
 import termios
 import threading
+import textwrap
 import time
 import tty
 import urllib.error
 import urllib.parse
 import urllib.request
 
+
+def use_local_environment():
+    """Use the environment made by ./setup without shell activation."""
+    root = os.path.dirname(os.path.realpath(__file__))
+    environment = os.path.join(root, ".venv")
+    python = os.path.join(environment, "bin", "python")
+    if os.path.isfile(python) and os.path.realpath(sys.prefix) != os.path.realpath(environment):
+        os.execv(python, [python, os.path.realpath(__file__), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    use_local_environment()
+
 try:
     import numpy as np
 except ImportError:
-    sys.exit("gloam needs numpy: pip install numpy")
+    sys.exit("gloam needs numpy. Run ./setup once, then ./gloam URL_OR_FILE.\n"
+             "Or install it in your own environment: python3 -m pip install numpy")
 try:
     import sounddevice as sd
 except Exception:
@@ -94,7 +117,7 @@ REACT_LEVELS = ((0.0, "off"), (0.5, "subtle"), (1.0, "gentle"), (1.6, "normal"),
 REACT_DEFAULT = 1.6
 PIPE_LEAD = 0.3
 AHEAD = 0.13
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 UA = f"gloam/{__version__}"
 try:
     import certifi
@@ -143,10 +166,12 @@ def hue_matrix(degrees):
 
 class Field:
 
-    def __init__(self, w, h, cw, ch, sat=0.5, keep_hue=0.0):
+    def __init__(self, w, h, cw, ch, sat=0.5, keep_hue=0.0, vignette=0.0, background=(0, 0, 0)):
         self.w, self.h = w, h
         self.sat = sat
         self.keep_hue = keep_hue
+        self.background = background
+        self.set_vignette(vignette)
         rx = 1600.0
         ry_rx = (h * ch) / (w * cw)
         off = 0.1 / I / 250 / 512
@@ -159,6 +184,17 @@ class Field:
         self.phase = np.hypot(ux + off * rx, uy + off * rx * ry_rx) + math.sin(I)
         lo, hi = self.dark.min(), self.dark.max()
         self.mid = (self.dark - lo) / (hi - lo or 1)
+
+    def set_vignette(self, width):
+        self.fade = None
+        if width:
+            # Separate smooth edges give a soft rectangular vignette with rounded corners.
+            x = np.linspace(-1, 1, self.w) if self.w > 1 else np.zeros(1)
+            y = np.linspace(-1, 1, self.h) if self.h > 1 else np.zeros(1)
+            fx = np.clip((1 - np.abs(x)) / width, 0, 1)
+            fy = np.clip((1 - np.abs(y)) / width, 0, 1)
+            self.fade = ((fy * fy * (3 - 2 * fy))[:, None] *
+                         (fx * fx * (3 - 2 * fx))[None, :])[..., None]
 
     @staticmethod
     def darkening(r):
@@ -179,7 +215,10 @@ class Field:
             c = c * (1 - mix) + self._shade(PALETTES[new], ph, dark) * mix
         if hue % 360:
             c = c @ np.array(hue_matrix(hue)).T
-        c = np.clip(c * (255 * bright / 100) + 0.5, 0, 255).astype(np.uint8)
+        c = np.clip(c * (255 * bright / 100), 0, 255)
+        if self.fade is not None:
+            c = c * self.fade + np.asarray(self.background) * (1 - self.fade)
+        c = np.clip(c + 0.5, 0, 255).astype(np.uint8)
         nums = ((ph % CYCLE) * 100 / CYCLE).astype(int) if numeric else None
         return c, nums
 
@@ -294,6 +333,74 @@ class Renderer:
             out.append(ESC + "[0m")
         self.previous, self.previous_status = cells, status
         return "".join(out)
+
+
+def write_frame(out, frame, clear=False, sync=True):
+    """Keep clearing and drawing within one synchronized terminal update."""
+    if not frame and not clear:
+        return
+    begin, end = (ESC + "[?2026h", ESC + "[?2026l") if sync else ("", "")
+    out.write(begin + (ESC + "[2J" if clear else "") + frame + end)
+    out.flush()
+
+
+def positive_fps(value):
+    fps = float(value)
+    if not math.isfinite(fps) or fps <= 0:
+        raise argparse.ArgumentTypeError("FPS must be a finite number greater than zero")
+    return fps
+
+
+def vignette_width(value):
+    width = float(value)
+    if not math.isfinite(width) or not 0 <= width <= 1:
+        raise argparse.ArgumentTypeError("vignette width must be between 0 and 1")
+    return width
+
+
+def hex_colour(value):
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+        raise argparse.ArgumentTypeError("background must be a colour like '#1e2030'")
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def background_reply(sequence):
+    match = re.fullmatch(r"\x1b\]11;rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/"
+                         r"([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)", sequence)
+    if match:
+        return tuple(round(int(channel, 16) * 255 / (16 ** len(channel) - 1))
+                     for channel in match.groups())
+    return None
+
+
+HELP_KEYS = (
+    "p / P: next / previous palette", "h: hold palette / resume automatic changes",
+    "v: toggle vignette", "( / ): narrower / wider vignette",
+    "[ / ]: darker / brighter", "+ / -: rotate hue forward / backward",
+    "< / > or , / .: slower / faster colours", "r / R: react more / less",
+    "Up / Down or 0 / 9: louder / quieter", "m: mute / unmute",
+    "{ / }: picture earlier / later by 10 ms", "n / b: next / previous source",
+    "t: show / hide now playing", "i: show audio output information",
+    "s: toggle current settings", "?: toggle help", "Space: next panel page",
+    "x: close panel", "q or Ctrl-C: quit",
+)
+
+
+def render_panel(title, entries, cols, rows, page=0, note=""):
+    """Wrap and paginate help/settings without writing outside the terminal."""
+    cols, rows = max(1, cols), max(1, rows)
+    lines = []
+    for entry in entries:
+        lines.extend(textwrap.wrap(entry, width=cols) or [""])
+    capacity = max(1, rows - 2)
+    pages = max(1, math.ceil(len(lines) / capacity))
+    page %= pages
+    body = lines[page * capacity:(page + 1) * capacity]
+    footer = note.strip() or f"{page + 1}/{pages} Space: next  x: close"
+    visible = ([title] + body + [""] * capacity)[:max(0, rows - 1)] + [footer]
+    return ESC + "[0m" + "".join(f"{ESC}[{y + 1};1H{ESC}[2K{line[:cols]}"
+                                  for y, line in enumerate(visible))
 
 
 class Analyser:
@@ -768,11 +875,12 @@ ARROWS = {"A": "0", "B": "9"}
 
 class Keys:
 
-    SEQ = re.compile(r"\x1b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
-    PART = re.compile(r"\x1b(?:\[[0-9;]*|O)?$")
+    SEQ = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+    PART = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x1b)?|\[[0-9;]*|O)?$")
 
     def __init__(self):
         self.pending, self.since = "", 0.0
+        self.background = None
 
     def feed(self, data, now):
         data = self.pending + data
@@ -785,7 +893,11 @@ class Keys:
                 continue
             m = self.SEQ.match(data, i)
             if m:
-                if m.group()[-1] in ARROWS:
+                if m.group().startswith(ESC + "]"):
+                    colour = background_reply(m.group())
+                    if colour is not None:
+                        self.background = colour
+                elif m.group()[-1] in ARROWS:
                     out.append(ARROWS[m.group()[-1]])
                 i = m.end()
             elif self.PART.match(data, i):
@@ -824,11 +936,20 @@ def main():
     ap.add_argument("--chunky", action="store_true", help="big cells, four columns by two rows")
     ap.add_argument("--256", dest="c256", action="store_true", help="256 colours")
     ap.add_argument("--nocolour", "--nocolor", action="store_true", help="ASCII")
-    ap.add_argument("--fps", type=float, default=30.0, help="frames per second (default 30)")
+    ap.add_argument("--fps", type=positive_fps, default=30.0, metavar="FPS",
+                    help="maximum frames per second (default 30; try 15 for slower terminals)")
+    ap.add_argument("--no-sync", action="store_true",
+                    help="disable synchronized terminal updates (enabled by default)")
     ap.add_argument("--speed", type=float, default=1.0, help="times the site's speed")
     ap.add_argument("--size", metavar="WxH", help="fixed size in characters")
     ap.add_argument("--hue", type=float, default=0.0, help="turn the colours this many degrees")
     ap.add_argument("--brightness", type=int, default=100, help="percent, 20 to 200")
+    ap.add_argument("--vignette", nargs="?", const=0.45, default=0.0, type=vignette_width,
+                    metavar="WIDTH", help="fade edges into the terminal background; width 0 to 1 (default 0.45 when enabled)")
+    ap.add_argument("--background", type=hex_colour, metavar="HEX",
+                    help="override vignette background, e.g. '#1e2030' (default auto-detect, or black)")
+    ap.add_argument("--settings", action="store_true", help="start with the current settings panel (s toggles it)")
+    ap.add_argument("--no-now-playing", action="store_true", help="hide the track display (t toggles it)")
     a = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
@@ -856,6 +977,8 @@ def main():
         sys.exit("--react wants a number from 0 to 10, or one of: " + ", ".join(names))
     sat = max(0.0, min(1.5, a.colour))
     keep_hue = 1 - max(0.0, min(1.0, a.white))
+    vignette = a.vignette
+    remembered_vignette = vignette or 0.45
 
     fd = sys.stdin.fileno()
     if not os.isatty(fd):
@@ -885,17 +1008,28 @@ def main():
         new, sweep = None, 0.0
         change_at = time.monotonic() + CHANGE_EVERY
         note, note_until = "", 0.0
+        view = "settings" if a.settings else None
+        panel_page, previous_panel = 0, None
+        redraw = False
+        now_playing = not a.no_now_playing
         reader = Keys()
+        background_queried = False
+        if a.vignette and a.background is None:
+            # OSC 11 is read alongside keys, so unsupported terminals never delay startup.
+            out.write(ESC + "]11;?\x07")
+            out.flush()
+            background_queried = True
         info_until = time.monotonic() + 6
         retry_at = None
         while True:
             cols, rows = fixed or os.get_terminal_size()
-            if (cols, rows) != size:
+            resized = (cols, rows) != size
+            if resized:
                 size = (cols, rows)
                 cw, ch = LAYOUTS[layout]
-                field = Field(max(1, cols // cw), max(1, (rows - 1) * 2 // ch), cw, ch, sat, keep_hue)
+                field = Field(max(1, cols // cw), max(1, (rows - 1) * 2 // ch), cw, ch, sat, keep_hue,
+                              vignette, a.background or reader.background or (0, 0, 0))
                 renderer = Renderer(mode, layout, mini_char)
-                out.write(ESC + "[2J")
             while True:
                 left = nxt - time.monotonic()
                 if reader.waiting(time.monotonic()):
@@ -905,19 +1039,53 @@ def main():
                     for k in reader.feed(os.read(fd, 1024).decode("latin-1"), time.monotonic()):
                         if k == "q":
                             return
+                        if k in "?s" or k == "x" and view:
+                            target = "help" if k == "?" else "settings" if k == "s" else None
+                            view = None if view == target else target
+                            panel_page, previous_panel = 0, None
+                            redraw = True
+                            renderer.previous = None
+                            note_until = 0
+                            continue
+                        if k == " " and view:
+                            panel_page += 1
+                            continue
+                        if k == "t":
+                            now_playing = not now_playing
+                            info_until = 0
+                            note = f"{'on' if now_playing else 'off'} now playing"
+                            note_until = time.monotonic() + 2.5
+                            continue
                         if k in "nb":
                             idx = (idx + (1 if k == "n" else -1)) % len(sources)
                             retry_at = None
                             player.play(sources[idx])
                             continue
-                        if k == "p":
-                            if new is None:
-                                new, sweep = NAMES[(NAMES.index(pal) + 1) % len(NAMES)], 0.0
-                            else:
-                                pal, sweep = new, 1.0
+                        if k in "pP":
+                            pal = ((new or NAMES[(NAMES.index(pal) + 1) % len(NAMES)]) if k == "p"
+                                   else NAMES[(NAMES.index(pal) - 1) % len(NAMES)])
+                            new, sweep = None, 0.0
+                            change_at = time.monotonic() + CHANGE_EVERY
                         elif k == "h":
                             hold = not hold
                             change_at = time.monotonic() + CHANGE_EVERY
+                        elif k in "v()":
+                            if k == "v":
+                                vignette = 0.0 if vignette else remembered_vignette
+                            else:
+                                vignette = round(max(0.0, min(1.0, (vignette or remembered_vignette)
+                                                           + (0.05 if k == ")" else -0.05))), 2)
+                            if vignette:
+                                remembered_vignette = vignette
+                                if a.background is None and not background_queried:
+                                    out.write(ESC + "]11;?\x07")
+                                    out.flush()
+                                    background_queried = True
+                            field.set_vignette(vignette)
+                            value = f"{vignette:.2f}" if vignette else "off"
+                            note = f"{value} vignette  (v toggle, ( narrower, ) wider)"
+                            note_until = time.monotonic() + 2.5
+                            continue
                         elif k in "+=-_":
                             hue = (hue + (15 if k in "+=" else -15)) % 360
                         elif k in "[]":
@@ -942,15 +1110,28 @@ def main():
                             player.ahead = max(0.0, min(1.0, player.ahead + (0.01 if k == "}" else -0.01)))
                         else:
                             continue
-                        vol = "muted" if player.muted else f"volume {int(player.vol * 100 + 0.5)}%"
-                        note = (f" {vol}  reacting {dict(REACT_LEVELS).get(react, f'{react:.2g}')}  ahead {player.ahead * 1000:.0f}ms  palette {new or pal}"
-                                f"{' (held)' if hold else ''}  hue {int(hue)}  brightness {bright}%  colour speed {speed:.2g}x")
+                        values = {
+                            "palette": f"{pal}" + (" (held)" if hold else ""),
+                            "hue": f"{hue:.0f} degrees", "brightness": f"{bright}%",
+                            "speed": f"{speed:.2g}x", "volume": f"{player.vol * 100:.0f}%",
+                            "mute": "on" if player.muted else "off",
+                            "reaction": dict(REACT_LEVELS).get(react, f"{react:.2g}"),
+                            "ahead": f"{player.ahead * 1000:.0f}ms",
+                        }
+                        setting = ("palette" if k in "pPh" else "hue" if k in "+=-_" else
+                                   "brightness" if k in "[]" else "speed" if k in "<>,." else
+                                   "volume" if k in "90" else "mute" if k == "m" else
+                                   "reaction" if k in "rR" else "ahead")
+                        note = f"{values[setting]} {setting}"
                         note_until = time.monotonic() + 2.5
                 if left <= 0:
                     break
             now = time.monotonic()
+            if a.background is None and reader.background is not None:
+                field.background = reader.background
             dt, last = min(0.25, now - last), now
-            nxt = max(nxt + tick, now - tick)
+            # Never catch up with a burst of frames after a slow render or write.
+            nxt = now + tick
 
             src = sources[idx]
             if retry_at is None and player.finished():
@@ -985,6 +1166,8 @@ def main():
                 status = note
             elif now < info_until:
                 status = player.info()
+            elif not now_playing:
+                status = ""
             else:
                 label = f"[{idx + 1}/{len(sources)}] " if len(sources) > 1 else ""
                 if player.state == "playing":
@@ -995,13 +1178,37 @@ def main():
                     status = f" {label}{short_name(src)}  {player.state}"
                     if retry_at is not None:
                         status += f"  (trying again in {int(retry_at - now) + 1}s)"
-            out.write(renderer.render(colours, nums, status, cols))
-            out.flush()
+            if view:
+                entries = HELP_KEYS if view == "help" else (
+                    f"Palette: {pal}" + (f" -> {new}" if new else ""),
+                    f"Palette hold: {'on' if hold else 'off'}",
+                    f"Vignette: {vignette:.2f}" + (f" (off; saved {remembered_vignette:.2f})" if not vignette else ""),
+                    f"Hue: {hue:.0f} degrees", f"Brightness: {bright}%",
+                    f"Colour speed: {speed:.2g}x", f"Colour richness: {sat:.2g}",
+                    f"Keep colour in highlights: {keep_hue:.2g}",
+                    f"Reaction: {dict(REACT_LEVELS).get(react, f'{react:.2g}')} ({react:.2g})",
+                    f"Volume: {player.vol * 100:.0f}%", f"Muted: {'yes' if player.muted else 'no'}",
+                    f"Picture ahead: {player.ahead * 1000:.0f}ms", f"FPS cap: {a.fps:g}",
+                    f"Layout: {layout}", f"Colour mode: {mode}", f"Size: {cols}x{rows}",
+                    f"Synchronized updates: {'off' if a.no_sync else 'on'}",
+                    f"Sound: {'off' if a.no_sound else 'on'}",
+                    f"Now playing display: {'on' if now_playing else 'off'}",
+                    f"Vignette background: {field.background}",
+                )
+                frame = render_panel("Gloam keys (?)" if view == "help" else "Gloam settings (s)",
+                                     entries, cols, rows, panel_page, note if now < note_until else "")
+                changed_panel = frame != previous_panel or resized or redraw
+                previous_panel = frame
+                frame = frame if changed_panel else ""
+            else:
+                frame = renderer.render(colours, nums, status, cols)
+            write_frame(out, frame, clear=resized or redraw, sync=not a.no_sync)
+            redraw = False
     except KeyboardInterrupt:
         pass
     finally:
         player.close()
-        out.write(ESC + "[0m" + ESC + "[?25h" + ESC + "[?1049l")
+        out.write(ESC + "[?2026l" + ESC + "[0m" + ESC + "[?25h" + ESC + "[?1049l")
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         if goodbye:
