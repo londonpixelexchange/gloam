@@ -30,7 +30,8 @@ Then commit and push the tap changes. Users can install with:
 brew install londonpixelexchange/tap/gloam
 ```
 
-For later releases, update the formula's tag, publish that tag, copy the updated
-formula to the tap, and test it before pushing. The Python version must match a
+For later releases, publish the tag, then update the formula's tag and full
+`revision` commit hash, copy the updated formula to the tap, and test it before
+pushing. The Python version must match a
 version supported by Homebrew's NumPy formula. Resource URLs and SHA-256 checksums
 pin the Python dependencies; refresh them when upgrading those dependencies.

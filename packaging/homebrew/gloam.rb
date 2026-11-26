@@ -3,7 +3,9 @@ class Gloam < Formula
 
   desc "Internet radio and music player with an audio-reactive terminal visualiser"
   homepage "https://github.com/londonpixelexchange/gloam"
-  url "https://github.com/londonpixelexchange/gloam.git", tag: "v1.1.0"
+  url "https://github.com/londonpixelexchange/gloam.git",
+      tag:      "v1.1.0",
+      revision: "461339190aaf16607dd7c90bfa8662cb380f4e62"
   license "MIT"
   head "https://github.com/londonpixelexchange/gloam.git", branch: "main"
 
@@ -42,7 +44,7 @@ class Gloam < Formula
     resource("sounddevice").stage do
       # ctypes cannot reliably find Homebrew's PortAudio on Apple silicon.
       portaudio_library = (formula_opt_lib("portaudio")/shared_library("libportaudio")).to_s.inspect
-      inreplace "sounddevice.py", "_libname = _find_library(_libname)",
+      inreplace "src/sounddevice.py", "_libname = _find_library(_libname)",
                 "_libname = #{portaudio_library}"
       venv.pip_install Pathname.pwd
     end
